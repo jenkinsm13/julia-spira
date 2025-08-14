@@ -962,14 +962,13 @@ function render_hybrid_gpu(width::Int, height::Int, scene::Scene, camera::Camera
                 # Accumulate colors directly on the GPU
                 render_state.img_buffer_gpu .+= mapped_colors # Use from RenderState
             end
-            end
         end
-        
-        println("Completed sample $sample / $samples_per_pixel")
     end
     
+    println("Completed sample $sample / $samples_per_pixel")
+    
     return finalize_image_from_gpu_buffer(render_state.img_buffer_gpu, width, height, samples_per_pixel) # Use from RenderState
-end # End of render_hybrid_gpu
+end
 
 # CPU fallback implementation (same as in spira-metal11.jl)
 function render_with_cpu(width, height, scene, camera; samples_per_pixel=16, max_depth=4)
