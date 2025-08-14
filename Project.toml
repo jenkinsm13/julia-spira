@@ -1,0 +1,25 @@
+name = "SPIRA"
+uuid = "12345678-1234-1234-1234-123456789abc"
+authors = ["jenkinsm13"]
+version = "0.1.0"
+
+[deps]
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Images = "916415d5-f1e6-5110-898d-aaa5f9f070e0"
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+FileIO = "5789e2e9-d7fb-5bc7-8068-2c6fae9b9549"
+Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
+
+[compat]
+julia = "1.8"
+Images = "0.25"
+StaticArrays = "1.0"
+FileIO = "1.0"
+Metal = "0.0.1-1.7.0"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]

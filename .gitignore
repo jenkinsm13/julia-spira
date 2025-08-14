@@ -38,3 +38,24 @@ dist/
 # Temporary files
 *.tmp
 *.temp
+
+# Julia package manager
+Manifest.toml
+
+# Environment files
+.env
+.env.local
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
