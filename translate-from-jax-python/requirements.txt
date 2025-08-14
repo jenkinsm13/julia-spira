@@ -1,0 +1,8 @@
+jax
+jaxlib
+numpy
+pillow
+optax
+tqdm
+perlin-noise 
+pywavefront 
