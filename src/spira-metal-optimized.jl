@@ -13,17 +13,38 @@ using Base.Threads
 println("SPIRA - Optimized Metal Raytracer")
 println("Julia version: ", VERSION)
 
-# Try to load Metal.jl
+# Try to load GPU backends; fall back to CPU if none are available
+has_cuda = false
+has_amdgpu = false
 has_metal = false
+
+try
+    using CUDA
+    global has_cuda = CUDA.functional()
+    has_cuda && println("CUDA GPU available: $(CUDA.device())")
+catch e
+    println("CUDA.jl not available: $e")
+end
+
+try
+    using AMDGPU
+    global has_amdgpu = AMDGPU.functional()
+    has_amdgpu && println("AMDGPU available: $(AMDGPU.device())")
+catch e
+    println("AMDGPU.jl not available: $e")
+end
+
 try
     using Metal
     global has_metal = true
-    println("Metal.jl loaded successfully!")
-    dev = Metal.device()
-    println("Metal device: $dev")
+    println("Metal GPU available: $(Metal.device())")
 catch e
     println("Metal.jl not available: $e")
-    println("Will use CPU rendering only")
+end
+
+const has_gpu = has_cuda || has_amdgpu || has_metal
+if !has_gpu
+    println("No supported GPU backend detected – rendering will use CPU")
 end
 
 # Type aliases for better performance
@@ -149,8 +170,8 @@ end # Total: 6 * 4 = 24 bytes. May need padding to 32 for MSL constant buffer be
 
 # Mutable struct to hold rendering state that needs to persist across GPU operations
 mutable struct RenderState
-    img_buffer_gpu::Metal.MtlMatrix{Float32}
-    rng_states_gpu::Metal.MtlVector{UInt32}
+    img_buffer_gpu::AbstractMatrix{Float32}
+    rng_states_gpu::AbstractVector{UInt32}
     # Add other variables here if they also prove to be unstable (e.g. width, height, spp)
 end
 
@@ -862,10 +883,22 @@ end
 # Simplified hybrid GPU/CPU path tracer
 function render_hybrid_gpu(width::Int, height::Int, scene::Scene, camera::Camera;
                           samples_per_pixel::Int=16, max_depth::Int=4)
-    
-    if !has_metal
-        println("Metal not available, falling back to CPU rendering.")
-        return render_with_cpu(width, height, scene, camera, 
+
+    if has_metal
+        backend = :metal
+    elseif has_cuda
+        println("CUDA backend detected but GPU kernels are not yet implemented; using CPU")
+        return render_with_cpu(width, height, scene, camera,
+                              samples_per_pixel=samples_per_pixel,
+                              max_depth=max_depth)
+    elseif has_amdgpu
+        println("AMDGPU backend detected but GPU kernels are not yet implemented; using CPU")
+        return render_with_cpu(width, height, scene, camera,
+                              samples_per_pixel=samples_per_pixel,
+                              max_depth=max_depth)
+    else
+        println("No GPU backend available, falling back to CPU rendering.")
+        return render_with_cpu(width, height, scene, camera,
                               samples_per_pixel=samples_per_pixel,
                               max_depth=max_depth)
     end
@@ -1085,12 +1118,22 @@ function render(scene::Scene, camera::Camera, width::Int, height::Int;
     # Time the rendering
     start_time = time()
     
-    # Render using the hybrid GPU approach
+    # Render using available backend
     if has_metal
         println("Rendering with Metal GPU (GPU-side accumulation)...")
         img = render_hybrid_gpu(width, height, scene, camera,
                                samples_per_pixel=samples_per_pixel,
                                max_depth=max_depth)
+    elseif has_cuda
+        println("CUDA GPU detected but Metal kernels are currently the only GPU implementation. Rendering on CPU.")
+        img = render_with_cpu(width, height, scene, camera,
+                             samples_per_pixel=samples_per_pixel,
+                             max_depth=max_depth)
+    elseif has_amdgpu
+        println("AMDGPU detected but Metal kernels are currently the only GPU implementation. Rendering on CPU.")
+        img = render_with_cpu(width, height, scene, camera,
+                             samples_per_pixel=samples_per_pixel,
+                             max_depth=max_depth)
     else
         println("Rendering with CPU...")
         img = render_with_cpu(width, height, scene, camera,
