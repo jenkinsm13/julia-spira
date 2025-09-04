@@ -26,6 +26,237 @@ catch e
     println("CUDA.jl not available: $e")
 end
 
+# CUDA tone mapping kernel
+function gpu_tone_map_kernel_cuda!(colors::CUDA.CuDeviceMatrix{Float32})
+    idx = (CUDA.blockIdx().x - 1) * CUDA.blockDim().x + CUDA.threadIdx().x
+    if idx >= size(colors,1)
+        return
+    end
+    idx1 = idx + 1
+    a = 2.51f0; b = 0.03f0; c = 2.43f0; d = 0.59f0; e = 0.14f0
+    r = colors[idx1,1]; g = colors[idx1,2]; bcol = colors[idx1,3]
+    r = (r*(a*r+b))/(r*(c*r+d)+e)
+    g = (g*(a*g+b))/(g*(c*g+d)+e)
+    bcol = (bcol*(a*bcol+b))/(bcol*(c*bcol+d)+e)
+    r = clamp(r,0f0,1f0); g = clamp(g,0f0,1f0); bcol = clamp(bcol,0f0,1f0)
+    colors[idx1,1] = sqrt(r)
+    colors[idx1,2] = sqrt(g)
+    colors[idx1,3] = sqrt(bcol)
+    return
+end
+# CUDA kernel for final image averaging
+function average_image_kernel_cuda!(
+    image_buffer::CUDA.CuDeviceMatrix{Float32},
+    num_samples_float::Float32,
+    total_pixels::UInt32)
+    idx = (CUDA.blockIdx().x - 1) * CUDA.blockDim().x + CUDA.threadIdx().x
+    if idx < total_pixels
+        image_buffer[idx+1,1] /= num_samples_float
+        image_buffer[idx+1,2] /= num_samples_float
+        image_buffer[idx+1,3] /= num_samples_float
+    end
+    return
+end
+
+# CUDA tone map wrapper
+function gpu_tone_map(colors::CUDA.CuArray{Float32,2})
+    num = size(colors,1)
+    if num > 0
+        threads = min(num,256)
+        blocks = cld(num, threads)
+        CUDA.@sync @cuda threads=threads blocks=blocks gpu_tone_map_kernel_cuda!(colors)
+    end
+    return colors
+end
+# CUDA scatter kernel
+function gpu_scatter_kernel_cuda!(
+    out_new_ray_origins::CUDA.CuDeviceMatrix{Float32},
+    out_new_ray_directions::CUDA.CuDeviceMatrix{Float32},
+    kernel_hit_results::CUDA.CuDeviceMatrix{Float32},
+    kernel_current_ray_directions::CUDA.CuDeviceMatrix{Float32},
+    kernel_hit_normals::CUDA.CuDeviceMatrix{Float32},
+    kernel_in_hit_points::CUDA.CuDeviceMatrix{Float32},
+    kernel_material_data::CUDA.CuDeviceVector{Float32},
+    kernel_rng_states::CUDA.CuDeviceVector{UInt32})
+
+    idx = (CUDA.blockIdx().x - 1) * CUDA.blockDim().x + CUDA.threadIdx().x
+    if idx >= size(kernel_hit_results,1)
+        return
+    end
+    idx1 = idx + 1
+
+    out_new_ray_origins[idx1,1] = kernel_in_hit_points[idx1,1]
+    out_new_ray_origins[idx1,2] = kernel_in_hit_points[idx1,2]
+    out_new_ray_origins[idx1,3] = kernel_in_hit_points[idx1,3]
+
+    if kernel_hit_results[idx1,1] > 0.0f0
+        mat_idx = Int(kernel_hit_results[idx1,3])
+        base = (mat_idx-1)*8 + 1
+        metallic = kernel_material_data[base+6]
+        roughness = kernel_material_data[base+7]
+        nx = kernel_hit_normals[idx1,1]; ny = kernel_hit_normals[idx1,2]; nz = kernel_hit_normals[idx1,3]
+        dx = kernel_current_ray_directions[idx1,1]; dy = kernel_current_ray_directions[idx1,2]; dz = kernel_current_ray_directions[idx1,3]
+        dotp = dx*nx + dy*ny + dz*nz
+        if metallic > 0.0f0
+            rx = dx - 2.0f0*dotp*nx
+            ry = dy - 2.0f0*dotp*ny
+            rz = dz - 2.0f0*dotp*nz
+            if roughness > 0.0f0
+                state = kernel_rng_states[idx1]
+                state = xorshift32_step(state); r1 = gpu_rand_float32_from_state(state)
+                state = xorshift32_step(state); r2 = gpu_rand_float32_from_state(state)
+                state = xorshift32_step(state); r3 = gpu_rand_float32_from_state(state)
+                kernel_rng_states[idx1] = state
+                rnd_x = r1 - 0.5f0; rnd_y = r2 - 0.5f0; rnd_z = r3 - 0.5f0
+                len = sqrt(rnd_x*rnd_x + rnd_y*rnd_y + rnd_z*rnd_z)
+                if len > 1e-5f0
+                    inv = 1.0f0/len; rnd_x *= inv; rnd_y *= inv; rnd_z *= inv
+                end
+                rx += roughness*rnd_x; ry += roughness*rnd_y; rz += roughness*rnd_z
+                inv = 1.0f0/sqrt(rx*rx + ry*ry + rz*rz)
+                rx *= inv; ry *= inv; rz *= inv
+            end
+            out_new_ray_directions[idx1,1] = rx
+            out_new_ray_directions[idx1,2] = ry
+            out_new_ray_directions[idx1,3] = rz
+        else
+            state = kernel_rng_states[idx1]
+            local_rnd_x = 0.0f0; local_rnd_y = 0.0f0; local_rnd_z = 0.0f0
+            while true
+                state = xorshift32_step(state); r1 = gpu_rand_float32_from_state(state)
+                state = xorshift32_step(state); r2 = gpu_rand_float32_from_state(state)
+                state = xorshift32_step(state); r3 = gpu_rand_float32_from_state(state)
+                local_rnd_x = r1*2.0f0 - 1.0f0
+                local_rnd_y = r2*2.0f0 - 1.0f0
+                local_rnd_z = r3*2.0f0 - 1.0f0
+                if local_rnd_x^2 + local_rnd_y^2 + local_rnd_z^2 <= 1.0f0
+                    break
+                end
+            end
+            kernel_rng_states[idx1] = state
+            dx2 = nx + local_rnd_x; dy2 = ny + local_rnd_y; dz2 = nz + local_rnd_z
+            len = dx2*dx2 + dy2*dy2 + dz2*dz2
+            if len < 1e-5f0
+                out_new_ray_directions[idx1,1] = nx
+                out_new_ray_directions[idx1,2] = ny
+                out_new_ray_directions[idx1,3] = nz
+            else
+                inv = 1.0f0/sqrt(len)
+                out_new_ray_directions[idx1,1] = dx2*inv
+                out_new_ray_directions[idx1,2] = dy2*inv
+                out_new_ray_directions[idx1,3] = dz2*inv
+            end
+        end
+    end
+    return
+end
+
+# CUDA kernel for shading rays
+function gpu_shade_kernel_cuda!(
+    out_colors::CUDA.CuDeviceMatrix{Float32},
+    hit_results::CUDA.CuDeviceMatrix{Float32},
+    ray_directions::CUDA.CuDeviceMatrix{Float32},
+    material_data::CUDA.CuDeviceVector{Float32},
+    contribution::CUDA.CuDeviceVector{Float32})
+    idx = (CUDA.blockIdx().x - 1) * CUDA.blockDim().x + CUDA.threadIdx().x
+    if idx >= size(ray_directions,1)
+        return
+    end
+    idx1 = idx + 1
+    if hit_results[idx1,1] > 0.0f0
+        mat_idx = Int(hit_results[idx1,3])
+        base = (mat_idx - 1) * 8
+        albedo_r = material_data[base + 1]
+        albedo_g = material_data[base + 2]
+        albedo_b = material_data[base + 3]
+        emission_r = material_data[base + 4]
+        emission_g = material_data[base + 5]
+        emission_b = material_data[base + 6]
+        contrib = contribution[idx1]
+        out_colors[idx1,1] = albedo_r * contrib + emission_r
+        out_colors[idx1,2] = albedo_g * contrib + emission_g
+        out_colors[idx1,3] = albedo_b * contrib + emission_b
+    else
+        dir_y = ray_directions[idx1,2]
+        t = 0.5f0*(dir_y + 1.0f0)
+        out_colors[idx1,1] = (1.0f0 - t) + t*0.5f0
+        out_colors[idx1,2] = (1.0f0 - t) + t*0.7f0
+        out_colors[idx1,3] = (1.0f0 - t) + t*1.0f0
+    end
+    return
+end
+# CUDA kernel for initial ray generation
+function gpu_generate_initial_sample_rays_kernel_cuda!(
+    out_ray_origins_gpu::CUDA.CuDeviceMatrix{Float32},
+    out_ray_directions_gpu::CUDA.CuDeviceMatrix{Float32},
+    cam_origin_x::Float32, cam_origin_y::Float32, cam_origin_z::Float32,
+    cam_llc_x::Float32, cam_llc_y::Float32, cam_llc_z::Float32,
+    cam_horiz_x::Float32, cam_horiz_y::Float32, cam_horiz_z::Float32,
+    cam_vert_x::Float32, cam_vert_y::Float32, cam_vert_z::Float32,
+    image_width::UInt32,
+    image_height::UInt32,
+    rng_states_gpu::CUDA.CuDeviceVector{UInt32},
+    current_sample_idx::UInt32,
+    jitter_scale_factor::Float32)
+
+    idx = (CUDA.blockIdx().x - 1) * CUDA.blockDim().x + CUDA.threadIdx().x
+    total = image_width * image_height
+    if idx >= total
+        return
+    end
+    idx1 = idx + 1
+
+    state = xorshift32_step(rng_states_gpu[idx1] + current_sample_idx)
+    state = xorshift32_step(state); rand1 = gpu_rand_float32_from_state(state)
+    state = xorshift32_step(state); rand2 = gpu_rand_float32_from_state(state)
+    rng_states_gpu[idx1] = state
+
+    col0 = idx % image_width
+    row0 = idx ÷ image_width
+    u_center = Float32(col0) / Float32(image_width - 1)
+    v_center = Float32(row0) / Float32(image_height - 1)
+    pixel_width_uv = 1.0f0 / Float32(image_width - 1)
+    pixel_height_uv = 1.0f0 / Float32(image_height - 1)
+    u_jittered = u_center + (rand1 - 0.5f0) * jitter_scale_factor * pixel_width_uv
+    v_jittered = v_center + (rand2 - 0.5f0) * jitter_scale_factor * pixel_height_uv
+
+    dir_x = cam_llc_x + u_jittered * cam_horiz_x + v_jittered * cam_vert_x - cam_origin_x
+    dir_y = cam_llc_y + u_jittered * cam_horiz_y + v_jittered * cam_vert_y - cam_origin_y
+    dir_z = cam_llc_z + u_jittered * cam_horiz_z + v_jittered * cam_vert_z - cam_origin_z
+    len_sq = dir_x*dir_x + dir_y*dir_y + dir_z*dir_z
+    inv_len = len_sq > 0.0f0 ? sqrt(1.0f0 / len_sq) : 0.0f0
+
+    out_ray_origins_gpu[idx1,1] = cam_origin_x
+    out_ray_origins_gpu[idx1,2] = cam_origin_y
+    out_ray_origins_gpu[idx1,3] = cam_origin_z
+
+    out_ray_directions_gpu[idx1,1] = dir_x * inv_len
+    out_ray_directions_gpu[idx1,2] = dir_y * inv_len
+    out_ray_directions_gpu[idx1,3] = dir_z * inv_len
+    return
+end
+
+# CUDA shading wrapper
+function gpu_shade_rays(hit_results::CUDA.CuArray{Float32,2},
+                       ray_directions::CUDA.CuArray{Float32,2},
+                       material_data::CUDA.CuArray{Float32,1},
+                       contribution::CUDA.CuArray{Float32,1})
+    num_rays = size(ray_directions,1)
+    colors = CUDA.CuArray{Float32}(undef, num_rays, 3)
+    if num_rays > 0
+        threads = min(num_rays,256)
+        blocks = cld(num_rays, threads)
+        CUDA.@sync @cuda threads=threads blocks=blocks gpu_shade_kernel_cuda!(
+            colors,
+            hit_results,
+            ray_directions,
+            material_data,
+            contribution,
+        )
+    end
+    return colors
+end
+
 try
     using AMDGPU
     global has_amdgpu = AMDGPU.functional()
@@ -466,9 +697,9 @@ function gpu_generate_initial_sample_rays_kernel!(
 end
 
 # Intersection test for rays and spheres using Metal.jl's array operations
-function gpu_ray_sphere_intersection(ray_origins::Metal.MtlArray{Float32, 2}, 
+function gpu_ray_sphere_intersection(ray_origins::Metal.MtlArray{Float32, 2},
                                      ray_directions::Metal.MtlArray{Float32, 2},
-                                     sphere_data::Metal.MtlArray{Float32, 1}, 
+                                     sphere_data::Metal.MtlArray{Float32, 1},
                                      num_spheres::Int)
     num_rays = size(ray_origins, 1)
     
@@ -564,6 +795,66 @@ function gpu_ray_sphere_intersection(ray_origins::Metal.MtlArray{Float32, 2},
         end
     end
     
+    return hit_results, hit_points, hit_normals
+end
+
+# CUDA version of ray-sphere intersection
+function gpu_ray_sphere_intersection(ray_origins::CUDA.CuArray{Float32, 2},
+                                     ray_directions::CUDA.CuArray{Float32, 2},
+                                     sphere_data::CUDA.CuArray{Float32, 1},
+                                     num_spheres::Int)
+    num_rays = size(ray_origins, 1)
+    hit_results = CUDA.CuArray{Float32}(undef, num_rays, 3)
+    hit_points = CUDA.CuArray{Float32}(undef, num_rays, 3)
+    hit_normals = CUDA.CuArray{Float32}(undef, num_rays, 3)
+    hit_results[:,1] .= 0.0f0
+    hit_results[:,2] .= Float32(1e20)
+    hit_results[:,3] .= 0.0f0
+    hit_points .= 0.0f0
+    hit_normals .= 0.0f0
+    CUDA.allowscalar() do
+        for s in 1:num_spheres
+            base_idx = (s-1) * 5 + 1
+            cx = sphere_data[base_idx]
+            cy = sphere_data[base_idx+1]
+            cz = sphere_data[base_idx+2]
+            r = sphere_data[base_idx+3]
+            mat = sphere_data[base_idx+4]
+
+            oc_x = ray_origins[:,1] .- cx
+            oc_y = ray_origins[:,2] .- cy
+            oc_z = ray_origins[:,3] .- cz
+            a = ray_directions[:,1].^2 + ray_directions[:,2].^2 + ray_directions[:,3].^2
+            half_b = oc_x .* ray_directions[:,1] + oc_y .* ray_directions[:,2] + oc_z .* ray_directions[:,3]
+            c = oc_x.^2 + oc_y.^2 + oc_z.^2 .- r^2
+            discriminant = half_b.^2 .- a .* c
+            hit_mask = discriminant .> Float32(0.0)
+            if any(hit_mask)
+                for idx in findall(hit_mask)
+                    sqrtd = sqrt(discriminant[idx])
+                    t1 = (-half_b[idx] - sqrtd) / a[idx]
+                    t2 = (-half_b[idx] + sqrtd) / a[idx]
+                    t = (t1 > Float32(0.001)) ? t1 : t2
+                    if t <= Float32(0.001) || t >= hit_results[idx,2]
+                        continue
+                    end
+                    hit_results[idx,1] = Float32(1.0)
+                    hit_results[idx,2] = t
+                    hit_results[idx,3] = mat
+                    hit_points[idx,1] = ray_origins[idx,1] + t*ray_directions[idx,1]
+                    hit_points[idx,2] = ray_origins[idx,2] + t*ray_directions[idx,2]
+                    hit_points[idx,3] = ray_origins[idx,3] + t*ray_directions[idx,3]
+                    nx = hit_points[idx,1] - cx
+                    ny = hit_points[idx,2] - cy
+                    nz = hit_points[idx,3] - cz
+                    inv_len = Float32(1.0) / sqrt(nx*nx + ny*ny + nz*nz)
+                    hit_normals[idx,1] = nx * inv_len
+                    hit_normals[idx,2] = ny * inv_len
+                    hit_normals[idx,3] = nz * inv_len
+                end
+            end
+        end
+    end
     return hit_results, hit_points, hit_normals
 end
 
@@ -698,10 +989,10 @@ function gpu_scatter_kernel!(
 end
 
 # Wrapper function to launch the gpu_scatter_kernel!
-function gpu_reflect_rays(hit_results_param::Metal.MtlArray{Float32, 2}, 
+function gpu_reflect_rays(hit_results_param::Metal.MtlArray{Float32, 2},
                          current_ray_directions_param::Metal.MtlArray{Float32, 2},
                          hit_normals_param::Metal.MtlArray{Float32, 2},
-                         in_hit_points_param::Metal.MtlArray{Float32, 2}, 
+                         in_hit_points_param::Metal.MtlArray{Float32, 2},
                          material_data_param::Metal.MtlArray{Float32, 1},
                          rng_states_gpu_param::Metal.MtlVector{UInt32})
     
@@ -732,6 +1023,34 @@ function gpu_reflect_rays(hit_results_param::Metal.MtlArray{Float32, 2},
     return out_new_ray_origins_gpu, out_new_ray_directions_gpu
 end
 
+# CUDA wrapper for scatter kernel
+function gpu_reflect_rays(hit_results_param::CUDA.CuArray{Float32, 2},
+                          current_ray_directions_param::CUDA.CuArray{Float32, 2},
+                          hit_normals_param::CUDA.CuArray{Float32, 2},
+                          in_hit_points_param::CUDA.CuArray{Float32, 2},
+                          material_data_param::CUDA.CuArray{Float32, 1},
+                          rng_states_gpu_param::CUDA.CuVector{UInt32})
+
+    num_rays = size(current_ray_directions_param, 1)
+    out_new_ray_origins_gpu = CUDA.CuArray{Float32}(undef, num_rays, 3)
+    out_new_ray_directions_gpu = copy(current_ray_directions_param)
+    if num_rays > 0
+        threads = min(num_rays, 256)
+        blocks = cld(num_rays, threads)
+        CUDA.@sync @cuda threads=threads blocks=blocks gpu_scatter_kernel_cuda!(
+            out_new_ray_origins_gpu,
+            out_new_ray_directions_gpu,
+            hit_results_param,
+            current_ray_directions_param,
+            hit_normals_param,
+            in_hit_points_param,
+            material_data_param,
+            rng_states_gpu_param,
+        )
+    end
+    return out_new_ray_origins_gpu, out_new_ray_directions_gpu
+end
+
 # Kernel for final image averaging
 function average_image_kernel!(
     image_buffer::Metal.MtlMatrix{Float32}, # Shape: (total_pixels, 3)
@@ -748,135 +1067,160 @@ function average_image_kernel!(
     return
 end
 
+# GPU kernel for shading rays
+function gpu_shade_kernel!(
+    out_colors::Metal.MtlMatrix{Float32},
+    hit_results::Metal.MtlMatrix{Float32},
+    ray_directions::Metal.MtlMatrix{Float32},
+    material_data::Metal.MtlVector{Float32},
+    contribution::Metal.MtlVector{Float32}
+)
+    idx = Metal.thread_position_in_grid_1d()
+    total = Metal.grid_size_1d()
+    if idx > total
+        return
+    end
+
+    if hit_results[idx, 1] > 0.0f0
+        mat_idx = Int(hit_results[idx, 3])
+        base = (mat_idx - 1) * 8
+        albedo_r = material_data[base + 1]
+        albedo_g = material_data[base + 2]
+        albedo_b = material_data[base + 3]
+        emission_r = material_data[base + 4]
+        emission_g = material_data[base + 5]
+        emission_b = material_data[base + 6]
+        contrib = contribution[idx]
+        out_colors[idx, 1] = albedo_r * contrib + emission_r
+        out_colors[idx, 2] = albedo_g * contrib + emission_g
+        out_colors[idx, 3] = albedo_b * contrib + emission_b
+    else
+        dir_y = ray_directions[idx, 2]
+        t = 0.5f0 * (dir_y + 1.0f0)
+        out_colors[idx, 1] = (1.0f0 - t) + t * 0.5f0
+        out_colors[idx, 2] = (1.0f0 - t) + t * 0.7f0
+        out_colors[idx, 3] = (1.0f0 - t) + t * 1.0f0
+    end
+    return
+end
+
 # Shade rays based on intersection results
 function gpu_shade_rays(hit_results::Metal.MtlArray{Float32, 2},
                        ray_directions::Metal.MtlArray{Float32, 2},
                        material_data::Metal.MtlArray{Float32, 1},
                        contribution::Metal.MtlArray{Float32, 1})
-    
     num_rays = size(ray_directions, 1)
     colors = Metal.MtlArray{Float32}(undef, num_rays, 3)
-
-    Metal.allowscalar() do
-        # Process each ray
-        for i in 1:num_rays
-            if hit_results[i, 1] > Float32(0.0)  # Ray hit something
-                # Get material properties
-                mat_idx = Int(hit_results[i, 3])
-                mat_base_idx = (mat_idx-1) * 8 + 1
-                
-                # Get material properties
-                albedo_r = material_data[mat_base_idx]
-                albedo_g = material_data[mat_base_idx+1]
-                albedo_b = material_data[mat_base_idx+2]
-                
-                emission_r = material_data[mat_base_idx+3]
-                emission_g = material_data[mat_base_idx+4]
-                emission_b = material_data[mat_base_idx+5]
-                
-                # Apply contribution factor
-                contrib = contribution[i]
-                
-                # Set color including emission
-                colors[i, 1] = albedo_r * contrib + emission_r
-                colors[i, 2] = albedo_g * contrib + emission_g
-                colors[i, 3] = albedo_b * contrib + emission_b
-            else
-                # Sky color for rays that don't hit anything
-                dir_y = ray_directions[i, 2]
-                t = Float32(0.5) * (dir_y + Float32(1.0))
-                
-                colors[i, 1] = (Float32(1.0) - t) + t * Float32(0.5)  # r
-                colors[i, 2] = (Float32(1.0) - t) + t * Float32(0.7)  # g
-                colors[i, 3] = (Float32(1.0) - t) + t * Float32(1.0)  # b
-            end
-        end
-    end # Metal.allowscalar()
-    
+    if num_rays > 0
+        threads = num_rays
+        groups = ceil(Int, num_rays / 256)
+        Metal.@sync @metal threads=threads groups=groups gpu_shade_kernel!(
+            colors,
+            hit_results,
+            ray_directions,
+            material_data,
+            contribution,
+        )
+    end
     return colors
+end
+
+function gpu_tone_map_kernel!(colors::Metal.MtlMatrix{Float32})
+    idx = Metal.thread_position_in_grid_1d()
+    total = Metal.grid_size_1d()
+    if idx > total
+        return
+    end
+    a = 2.51f0; b = 0.03f0; c = 2.43f0; d = 0.59f0; e = 0.14f0
+    r = colors[idx, 1]; g = colors[idx, 2]; bcol = colors[idx, 3]
+    r = (r * (a * r + b)) / (r * (c * r + d) + e)
+    g = (g * (a * g + b)) / (g * (c * g + d) + e)
+    bcol = (bcol * (a * bcol + b)) / (bcol * (c * bcol + d) + e)
+    r = clamp(r, 0f0, 1f0); g = clamp(g, 0f0, 1f0); bcol = clamp(bcol, 0f0, 1f0)
+    colors[idx, 1] = sqrt(r)
+    colors[idx, 2] = sqrt(g)
+    colors[idx, 3] = sqrt(bcol)
+    return
 end
 
 # Tone mapping function
 function gpu_tone_map(colors::Metal.MtlArray{Float32, 2})
-    # ACES filmic tone mapping (simplified)
-    a = Float32(2.51)
-    b = Float32(0.03)
-    c = Float32(2.43)
-    d = Float32(0.59)
-    e = Float32(0.14)
-    
-    # Apply tone mapping formula to each channel
-    r = colors[:, 1]
-    g = colors[:, 2]
-    b = colors[:, 3]
-    
-    # ACES tone mapping
-    mapped_r = (r .* (a .* r .+ b)) ./ (r .* (c .* r .+ d) .+ e)
-    mapped_g = (g .* (a .* g .+ b)) ./ (g .* (c .* g .+ d) .+ e)
-    mapped_b = (b .* (a .* b .+ b)) ./ (b .* (c .* b .+ d) .+ e)
-    
-    # Clamp to [0,1]
-    mapped_r = clamp.(mapped_r, Float32(0.0), Float32(1.0))
-    mapped_g = clamp.(mapped_g, Float32(0.0), Float32(1.0))
-    mapped_b = clamp.(mapped_b, Float32(0.0), Float32(1.0))
-    
-    # Gamma correction
-    mapped_r = sqrt.(mapped_r)
-    mapped_g = sqrt.(mapped_g)
-    mapped_b = sqrt.(mapped_b)
-    
-    return Metal.MtlArray(hcat(mapped_r, mapped_g, mapped_b))
+    num = size(colors, 1)
+    if num > 0
+        threads = num
+        groups = ceil(Int, num / 256)
+        Metal.@sync @metal threads=threads groups=groups gpu_tone_map_kernel!(colors)
+    end
+    return colors
 end
 
 function finalize_image_from_gpu_buffer(
-    img_buffer_gpu_arg::Metal.MtlMatrix{Float32}, 
-    p_width::Int, 
-    p_height::Int, 
-    p_samples_per_pixel::Int
-)
-    # Average samples on the GPU using a kernel
+    img_buffer_gpu_arg::Metal.MtlMatrix{Float32},
+    p_width::Int,
+    p_height::Int,
+    p_samples_per_pixel::Int)
     if (p_width * p_height) > 0 && p_samples_per_pixel > 0
         num_samples_val_float32 = Float32(p_samples_per_pixel)
-        # Kernel launch configuration (1D for pixels)
-        current_total_pixels = p_width * p_height # Use local calculation for clarity
+        current_total_pixels = p_width * p_height
         threads_avg_kernel = current_total_pixels
-        groups_avg_kernel = ceil(Int, current_total_pixels / 256) # Using a common group size
-
+        groups_avg_kernel = ceil(Int, current_total_pixels / 256)
         Metal.@sync @metal threads=threads_avg_kernel groups=groups_avg_kernel average_image_kernel!(
             img_buffer_gpu_arg,
             num_samples_val_float32,
             UInt32(current_total_pixels)
         )
-    elseif p_samples_per_pixel == 0 && (p_width * p_height) > 0 # Avoid division by zero
-        img_buffer_gpu_arg .= 0.0f0 # Or some other defined state
+    elseif p_samples_per_pixel == 0 && (p_width * p_height) > 0
+        img_buffer_gpu_arg .= 0.0f0
     end
-    
-    # Transfer final averaged image data from GPU to CPU
-    final_colors_cpu_flat = Array(img_buffer_gpu_arg) # Shape: (width*height, 3)
-                                                  # Order: ray (i=1,j=1 bottom-left) is index 1
-                                                  # ray (i=width,j=1 bottom-right) is index width
-                                                  # ray (i=1,j=height top-left) is index (height-1)*width+1
-    
-    # Create final RGB image on CPU, reconstructing from flat array
-    # The output image `img` should have img[1,1] as top-left pixel.
+    final_colors_cpu_flat = Array(img_buffer_gpu_arg)
     img = Array{RGB{Float32}}(undef, p_height, p_width)
-    for j_img in 1:p_height  # Output image row: 1=top, height=bottom
-        for i_img in 1:p_width # Output image col: 1=left, width=right
-            # Corresponding ray generation indices (j_ray=1 is bottom, i_ray=1 is left)
+    for j_img in 1:p_height
+        for i_img in 1:p_width
             i_ray = i_img
-            j_ray = p_height - j_img + 1 
-            
-            # Index in the flat array
+            j_ray = p_height - j_img + 1
             flat_idx = (j_ray - 1) * p_width + i_ray
-            
             img[j_img, i_img] = RGB{Float32}(
-                final_colors_cpu_flat[flat_idx, 1],
-                final_colors_cpu_flat[flat_idx, 2],
-                final_colors_cpu_flat[flat_idx, 3]
+                final_colors_cpu_flat[flat_idx,1],
+                final_colors_cpu_flat[flat_idx,2],
+                final_colors_cpu_flat[flat_idx,3]
             )
         end
     end
-    
+    return img
+end
+
+function finalize_image_from_gpu_buffer(
+    img_buffer_gpu_arg::CUDA.CuMatrix{Float32},
+    p_width::Int,
+    p_height::Int,
+    p_samples_per_pixel::Int)
+    if (p_width * p_height) > 0 && p_samples_per_pixel > 0
+        num_samples_val_float32 = Float32(p_samples_per_pixel)
+        current_total_pixels = p_width * p_height
+        threads_avg_kernel = min(current_total_pixels,256)
+        blocks_avg_kernel = cld(current_total_pixels, threads_avg_kernel)
+        CUDA.@sync @cuda threads=threads_avg_kernel blocks=blocks_avg_kernel average_image_kernel_cuda!(
+            img_buffer_gpu_arg,
+            num_samples_val_float32,
+            UInt32(current_total_pixels)
+        )
+    elseif p_samples_per_pixel == 0 && (p_width * p_height) > 0
+        img_buffer_gpu_arg .= 0.0f0
+    end
+    final_colors_cpu_flat = Array(img_buffer_gpu_arg)
+    img = Array{RGB{Float32}}(undef, p_height, p_width)
+    for j_img in 1:p_height
+        for i_img in 1:p_width
+            i_ray = i_img
+            j_ray = p_height - j_img + 1
+            flat_idx = (j_ray - 1) * p_width + i_ray
+            img[j_img, i_img] = RGB{Float32}(
+                final_colors_cpu_flat[flat_idx,1],
+                final_colors_cpu_flat[flat_idx,2],
+                final_colors_cpu_flat[flat_idx,3]
+            )
+        end
+    end
     return img
 end
 
@@ -887,10 +1231,7 @@ function render_hybrid_gpu(width::Int, height::Int, scene::Scene, camera::Camera
     if has_metal
         backend = :metal
     elseif has_cuda
-        println("CUDA backend detected but GPU kernels are not yet implemented; using CPU")
-        return render_with_cpu(width, height, scene, camera,
-                              samples_per_pixel=samples_per_pixel,
-                              max_depth=max_depth)
+        backend = :cuda
     elseif has_amdgpu
         println("AMDGPU backend detected but GPU kernels are not yet implemented; using CPU")
         return render_with_cpu(width, height, scene, camera,
@@ -902,29 +1243,25 @@ function render_hybrid_gpu(width::Int, height::Int, scene::Scene, camera::Camera
                               samples_per_pixel=samples_per_pixel,
                               max_depth=max_depth)
     end
-    
-    # Prepare scene data
+
     sphere_data, material_data = prepare_scene_data(scene)
-    sphere_data_gpu = Metal.MtlArray(sphere_data)
-    material_data_gpu = Metal.MtlArray(material_data)
-    
-    # Convert Camera to Camera_jl for GPU
+    if backend == :metal
+        sphere_data_gpu = Metal.MtlArray(sphere_data)
+        material_data_gpu = Metal.MtlArray(material_data)
+    else
+        sphere_data_gpu = CUDA.CuArray(sphere_data)
+        material_data_gpu = CUDA.CuArray(material_data)
+    end
+
     camera_jl = Camera_jl(camera.origin, camera.lower_left_corner, camera.horizontal, camera.vertical)
 
-    # Initialize RNG states on GPU
-    # Seed with random numbers from CPU, or a deterministic sequence.
-    rng_states_gpu = Metal.MtlArray(rand(UInt32, width * height))
-    # Or for deterministic: rng_states_gpu = Metal.MtlArray(UInt32.((1:(width*height)) .% typemax(UInt32)))
-    
-    # Create image buffer on the GPU
-    img_buffer_gpu_init = Metal.zeros(Float32, width * height, 3) # Use a distinct name for initialization
+    rng_states_gpu = backend == :metal ? Metal.MtlArray(rand(UInt32, width*height)) : CUDA.CuArray(rand(UInt32, width*height))
 
-    # Initialize RenderState
+    img_buffer_gpu_init = backend == :metal ? Metal.zeros(Float32, width*height, 3) : CUDA.zeros(Float32, width*height, 3)
     render_state = RenderState(img_buffer_gpu_init, rng_states_gpu)
 
-    # Pre-allocate GPU arrays for current rays (these are transient per sample/depth)
-    current_ray_origins_gpu = Metal.MtlArray{Float32}(undef, width * height, 3)
-    current_ray_directions_gpu = Metal.MtlArray{Float32}(undef, width * height, 3)
+    current_ray_origins_gpu = backend == :metal ? Metal.MtlArray{Float32}(undef, width*height,3) : CUDA.CuArray{Float32}(undef, width*height,3)
+    current_ray_directions_gpu = backend == :metal ? Metal.MtlArray{Float32}(undef, width*height,3) : CUDA.CuArray{Float32}(undef, width*height,3)
     
     # Get number of spheres
     num_spheres = length(scene.spheres)
@@ -935,28 +1272,38 @@ function render_hybrid_gpu(width::Int, height::Int, scene::Scene, camera::Camera
     num_groups = ceil(Int, total_pixels / threads_per_group)
 
     for sample in 1:samples_per_pixel
-        # Generate initial rays for this sample directly on GPU
-        Metal.@sync @metal threads=total_pixels groups=num_groups gpu_generate_initial_sample_rays_kernel!(
-            current_ray_origins_gpu, current_ray_directions_gpu,
-            camera_jl.origin[1], camera_jl.origin[2], camera_jl.origin[3],
-            camera_jl.lower_left_corner[1], camera_jl.lower_left_corner[2], camera_jl.lower_left_corner[3],
-            camera_jl.horizontal[1], camera_jl.horizontal[2], camera_jl.horizontal[3],
-            camera_jl.vertical[1], camera_jl.vertical[2], camera_jl.vertical[3],
-            UInt32(width), UInt32(height),
-            render_state.rng_states_gpu, # Use from RenderState
-            UInt32(sample), # current_sample_idx
-            0.5f0           # jitter_scale_factor (half pixel extent for jitter)
-        )
-        
-        # Initialize contribution for each ray for this sample
-        contribution_gpu = Metal.ones(Float32, width * height) # Reset for each sample path
+        if backend == :metal
+            Metal.@sync @metal threads=threads_per_group groups=num_groups gpu_generate_initial_sample_rays_kernel!(
+                current_ray_origins_gpu, current_ray_directions_gpu,
+                camera_jl.origin[1], camera_jl.origin[2], camera_jl.origin[3],
+                camera_jl.lower_left_corner[1], camera_jl.lower_left_corner[2], camera_jl.lower_left_corner[3],
+                camera_jl.horizontal[1], camera_jl.horizontal[2], camera_jl.horizontal[3],
+                camera_jl.vertical[1], camera_jl.vertical[2], camera_jl.vertical[3],
+                UInt32(width), UInt32(height),
+                render_state.rng_states_gpu,
+                UInt32(sample),
+                0.5f0,
+            )
+        else
+            CUDA.@sync @cuda threads=threads_per_group blocks=num_groups gpu_generate_initial_sample_rays_kernel_cuda!(
+                current_ray_origins_gpu, current_ray_directions_gpu,
+                camera_jl.origin[1], camera_jl.origin[2], camera_jl.origin[3],
+                camera_jl.lower_left_corner[1], camera_jl.lower_left_corner[2], camera_jl.lower_left_corner[3],
+                camera_jl.horizontal[1], camera_jl.horizontal[2], camera_jl.horizontal[3],
+                camera_jl.vertical[1], camera_jl.vertical[2], camera_jl.vertical[3],
+                UInt32(width), UInt32(height),
+                render_state.rng_states_gpu,
+                UInt32(sample),
+                0.5f0,
+            )
+        end
+
+        contribution_gpu = backend == :metal ? Metal.ones(Float32, width*height) : CUDA.ones(Float32, width*height)
         
         # Path tracing loop for current sample
         for depth in 1:max_depth
-            # Trace rays against spheres
             hit_results, hit_points, hit_normals = gpu_ray_sphere_intersection(
-                current_ray_origins_gpu, current_ray_directions_gpu, sphere_data_gpu, num_spheres
-            )
+                current_ray_origins_gpu, current_ray_directions_gpu, sphere_data_gpu, num_spheres)
             
             # Break if no rays hit anything (check on GPU, transfer only sum)
             if Metal.sum(hit_results[:, 1]) == 0.0f0
@@ -985,21 +1332,13 @@ function render_hybrid_gpu(width::Int, height::Int, scene::Scene, camera::Camera
             
             # If at max depth, we'll shade these rays
             if depth == max_depth
-                # Shade rays and accumulate to image buffer
-                # Pass current_ray_directions_gpu for sky color calculation if no hit
                 colors = gpu_shade_rays(hit_results, current_ray_directions_gpu, material_data_gpu, contribution_gpu)
-                
-                # Apply tone mapping
-                mapped_colors = gpu_tone_map(colors) # mapped_colors is MtlArray (width*height, 3)
-                
-                # Accumulate colors directly on the GPU
-                render_state.img_buffer_gpu .+= mapped_colors # Use from RenderState
+                mapped_colors = gpu_tone_map(colors)
+                render_state.img_buffer_gpu .+= mapped_colors
             end
         end
+        println("Completed sample $sample / $samples_per_pixel")
     end
-    
-    println("Completed sample $sample / $samples_per_pixel")
-    
     return finalize_image_from_gpu_buffer(render_state.img_buffer_gpu, width, height, samples_per_pixel) # Use from RenderState
 end
 
@@ -1118,19 +1457,17 @@ function render(scene::Scene, camera::Camera, width::Int, height::Int;
     # Time the rendering
     start_time = time()
     
-    # Render using available backend
-    if has_metal
-        println("Rendering with Metal GPU (GPU-side accumulation)...")
+    if has_metal || has_cuda
+        if has_metal
+            println("Rendering with Metal GPU (GPU-side accumulation)...")
+        else
+            println("Rendering with CUDA GPU (GPU-side accumulation)...")
+        end
         img = render_hybrid_gpu(width, height, scene, camera,
                                samples_per_pixel=samples_per_pixel,
                                max_depth=max_depth)
-    elseif has_cuda
-        println("CUDA GPU detected but Metal kernels are currently the only GPU implementation. Rendering on CPU.")
-        img = render_with_cpu(width, height, scene, camera,
-                             samples_per_pixel=samples_per_pixel,
-                             max_depth=max_depth)
     elseif has_amdgpu
-        println("AMDGPU detected but Metal kernels are currently the only GPU implementation. Rendering on CPU.")
+        println("AMDGPU detected but GPU kernels are not implemented. Rendering on CPU.")
         img = render_with_cpu(width, height, scene, camera,
                              samples_per_pixel=samples_per_pixel,
                              max_depth=max_depth)
