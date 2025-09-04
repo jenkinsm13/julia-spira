@@ -3,7 +3,7 @@
 # Tiny test script for the Metal-optimized ray tracer
 # Uses absolutely minimal settings for fastest testing
 
-include("spira-metal-optimized.jl")
+include(joinpath(@__DIR__, "../src/spira-metal-optimized.jl"))
 
 # Override main function with minimal settings
 function tiny_test()
@@ -36,3 +36,4 @@ end
 
 # Run the test
 tiny_test()
+
