@@ -716,12 +716,12 @@ function render_example(; width=1280, height=720, samples=200, interactive=true,
     println("Rendering with $samples samples per pixel...")
     image, hdr_data = render(scene, camera, width, height, samples_per_pixel=samples, max_depth=25)
     
-    # Save as EXR (ACEScg color space, 32-bit)
-    if !interactive || output_file != ""
+    # Save as EXR (ACEScg color space, 32-bit) if an output path is given
+    if output_file != ""
         println("Saving to $output_file...")
         save_exr(hdr_data, output_file)
     end
-    
+
     # Display the image if interactive mode
     if interactive
         println("Displaying rendered image...")
@@ -861,5 +861,8 @@ function main()
     )
 end
 
-# Run the main function
-main()
+# Run the main function when executed as a script
+if abspath(PROGRAM_FILE) == @__FILE__
+    main()
+end
+

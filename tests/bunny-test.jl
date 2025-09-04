@@ -1,8 +1,14 @@
 # Simple test script to render a scene with Stanford bunny
-include("julia-raytracer.jl")
+# Run Plots headless during tests
+ENV["GKSwstype"] = "100"
+
+# Include the example raytracer relative to this file
+include(joinpath(@__DIR__, "../examples/julia-raytracer.jl"))
+using Test
 
 function download_bunny_if_needed()
     bunny_path = expanduser("~/Downloads/bunny.obj")
+    mkpath(dirname(bunny_path))
     
     # Check if the bunny file already exists
     if !isfile(bunny_path)
@@ -27,29 +33,34 @@ function download_bunny_if_needed()
     return true
 end
 
-# Ensure we have the Stanford bunny
-if download_bunny_if_needed()
-    # Set up parameters for a quick render to test OBJ loading
-    width = 640
-    height = 360
-    samples = 50
-    output_file = "bunny_render.exr"
-    
-    # Create a scene with the bunny
+# Run a small render of the high‑poly bunny and verify output
+function run_bunny_render_test()
+    width = 64
+    height = 64
+    samples = 1
+    output_file = ""
+
+    # Create a scene with the bunny mesh
     println("Creating scene with Stanford bunny...")
     scene, camera = create_scene_with_obj()
-    
-    # Render the scene
-    println("Rendering bunny scene with $samples samples per pixel...")
-    render_example(
+
+    # Render the scene without displaying it
+    println("Rendering bunny scene with $samples sample per pixel...")
+    image, _ = render_example(
         width=width,
         height=height,
         samples=samples,
-        interactive=true,
+        interactive=false,
         output_file=output_file,
         scene=scene,
-        camera=camera
+        camera=camera,
     )
-else
-    println("Cannot render without the bunny model.")
+
+    return size(image) == (height, width)
 end
+
+@testset "Bunny render" begin
+    @test download_bunny_if_needed()
+    @test run_bunny_render_test()
+end
+
