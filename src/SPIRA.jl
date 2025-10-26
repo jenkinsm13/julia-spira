@@ -12,6 +12,9 @@ export Scene, Camera, Material, Sphere, Ray
 export render, create_scene
 export render_hybrid_gpu, render_with_cpu
 
+# Include core data structures and functions
+include("core.jl")
+
 # Include GPU-accelerated implementation only when Metal is available
 if Base.find_package("Metal") !== nothing
     include("spira-metal-optimized.jl")
